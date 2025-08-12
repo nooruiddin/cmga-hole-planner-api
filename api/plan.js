@@ -1,8 +1,7 @@
-// api/plan.js — CMGA hole planner endpoint (Vercel Serverless Function)
-// Uses OpenAI Responses API with text.format JSON schema.
+// api/plan.js — CMGA hole planner (Chat Completions + Structured Outputs)
 
 export default async function handler(req, res) {
-  // --- CORS (allow www + bare domain) ---
+  // --- CORS (www + bare domain) ---
   const allowed = new Set(["https://www.canadamga.ca","https://canadamga.ca"]);
   const origin = req.headers.origin || "";
   res.setHeader("Access-Control-Allow-Origin", allowed.has(origin) ? origin : "https://www.canadamga.ca");
@@ -13,18 +12,16 @@ export default async function handler(req, res) {
 
   // --- Body parse (JSON or raw) ---
   let body = req.body;
-  if (!body || typeof body !== "object") {
-    try { body = JSON.parse(req.body || "{}"); } catch { body = {}; }
-  }
+  if (!body || typeof body !== "object") { try { body = JSON.parse(req.body || "{}"); } catch { body = {}; } }
 
-  // Ping to confirm deploy version
-  if (body && body.ping) return res.status(200).json({ ok:true, version:"v2025-08-12-text.format+name" });
+  // Ping to verify deploy
+  if (body && body.ping) return res.status(200).json({ ok:true, version:"v2025-08-12-chat.completions-structured" });
 
   const { hole, par, notes, miss, handicap, wind } = body || {};
   const haveHole  = !(hole === undefined || hole === null || hole === "");
   const haveNotes = notes && Array.isArray(notes.safe) && Array.isArray(notes.avoid);
 
-  // Mock mode (set MOCK=1 in Vercel env to bypass OpenAI)
+  // Mock mode (optional): set MOCK=1 in Vercel env
   if (process.env.MOCK === "1") {
     return res.status(200).json({
       conservative: "Fairway finder to center-green.",
@@ -60,14 +57,16 @@ ${haveNotes ? "" : "\n(Notes were missing; using generic safety notes.)"}
     return res.status(200).json({ error: "Missing OPENAI_API_KEY on server" });
   }
 
-  // ✅ New Responses API: text.format needs a NAME
+  // ✅ Chat Completions + Structured Outputs (response_format.json_schema)
   const payload = {
-    model: "gpt-4o-mini", // if you hit “model not found”, change to "o4-mini"
-    input: prompt,
-    text: {
-      format: {
-        type: "json_schema",
-        name: "hole_plan",          // <-- REQUIRED (this was the missing field)
+    model: "gpt-4o-mini", // if you see "model not found", change to "o4-mini"
+    messages: [
+      { role: "system", content: prompt }
+    ],
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "hole_plan",
         strict: true,
         schema: {
           type: "object",
@@ -82,11 +81,12 @@ ${haveNotes ? "" : "\n(Notes were missing; using generic safety notes.)"}
           required: ["conservative","neutral","aggressive"]
         }
       }
-    }
+    },
+    max_tokens: 400
   };
 
   try {
-    const r = await fetch("https://api.openai.com/v1/responses", {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -98,22 +98,12 @@ ${haveNotes ? "" : "\n(Notes were missing; using generic safety notes.)"}
     const txt = await r.text();
     if (!r.ok) return res.status(200).json({ openai_status: r.status, openai_error: txt.slice(0, 2000) });
 
-    let data; try { data = JSON.parse(txt); }
-    catch { return res.status(200).json({ error: "OpenAI non-JSON", raw: txt.slice(0,2000) }); }
+    let data; try { data = JSON.parse(txt); } catch { return res.status(200).json({ error: "OpenAI non-JSON", raw: txt.slice(0,2000) }); }
 
-    let outText = data.output_text;
-    if (!outText && Array.isArray(data.output)) {
-      try {
-        outText = data.output
-          .flatMap(o => Array.isArray(o.content) ? o.content : [])
-          .map(c => (typeof c.text === "string" ? c.text : ""))
-          .join("");
-      } catch {}
-    }
-    if (!outText || !outText.trim()) return res.status(200).json({ error: "No text output from model" });
+    const content = data?.choices?.[0]?.message?.content || "";
+    if (!content.trim()) return res.status(200).json({ error: "Empty completion" });
 
-    let out; try { out = JSON.parse(outText); }
-    catch { return res.status(200).json({ error: "Model output invalid JSON", raw: outText.slice(0,2000) }); }
+    let out; try { out = JSON.parse(content); } catch { return res.status(200).json({ error: "Model output invalid JSON", raw: content.slice(0,2000) }); }
 
     if (!haveNotes || !haveHole) {
       out.warnings = (out.warnings ? out.warnings + " " : "") + "Generic guidance: request lacked full hole/notes.";

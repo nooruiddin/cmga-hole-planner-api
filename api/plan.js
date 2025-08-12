@@ -1,7 +1,7 @@
-// api/plan.js — CMGA hole planner (Chat Completions + Structured Outputs)
+// api/plan.js — Chat Completions + Structured Outputs (flag color mapping + fast greens default)
 
 export default async function handler(req, res) {
-  const allowed = new Set(["https://www.canadamga.ca","https://canadamga.ca","https://www.canadamga.ca/shawneeki-golf-club"]);
+  const allowed = new Set(["https://www.canadamga.ca","https://canadamga.ca"]);
   const origin = req.headers.origin || "";
   res.setHeader("Access-Control-Allow-Origin", allowed.has(origin) ? origin : "https://www.canadamga.ca");
   res.setHeader("Access-Control-Allow-Headers", "content-type");
@@ -12,17 +12,33 @@ export default async function handler(req, res) {
   let body = req.body;
   if (!body || typeof body !== "object") { try { body = JSON.parse(req.body || "{}"); } catch { body = {}; } }
 
-  // Ping to verify deploy
-  if (body && body.ping) return res.status(200).json({ ok:true, version:"v2025-08-12-chat.completions-structured" });
+  if (body && body.ping) return res.status(200).json({ ok:true, version:"v2025-08-12-captain-flagcolor-fast10" });
 
-  const { hole, par, notes, miss, handicap, wind } = body || {};
+  const {
+    hole, par, notes, miss, handicap, wind,
+    wind_strength, green_speed, captain_mode, pin_lr, pin_fb, flag_color
+  } = body || {};
+
   const haveHole  = !(hole === undefined || hole === null || hole === "");
   const haveNotes = notes && Array.isArray(notes.safe) && Array.isArray(notes.avoid);
+
+  // Map flag color -> depth if needed
+  const mapFlag = (c)=>{
+    const v = (c||"").toLowerCase();
+    if (v === "red") return "F";
+    if (v === "white") return "M";
+    if (v === "blue") return "B";
+    return null;
+  };
+
+  const effPinFB   = pin_fb || mapFlag(flag_color);
+  const effGreen   = green_speed || "Fast (~10 stimp)"; // course provided info
+  const effFlagTxt = flag_color ? `${flag_color} (${effPinFB === "F" ? "front" : effPinFB === "M" ? "middle" : effPinFB === "B" ? "back" : "unknown"})` : "—";
 
   if (process.env.MOCK === "1") {
     return res.status(200).json({
       conservative: "Fairway finder to center-green.",
-      neutral: "Normal tee to widest side; take the two-putt.",
+      neutral: "Normal tee to widest side; two-putt target.",
       aggressive: "Only take on the tight line if the miss is safe.",
       club_suggestions: ["3-wood","Hybrid","Gap wedge"],
       warnings: haveNotes ? "" : "Generic guidance: client did not send hole notes."
@@ -32,21 +48,36 @@ export default async function handler(req, res) {
   const safeArr  = haveNotes ? notes.safe  : ["Favor center line; play to the fat side."];
   const avoidArr = haveNotes ? notes.avoid : ["Don’t short-side; avoid water/front penalties."];
 
- const prompt = `
+  const condLines = [
+    `handicap: ${handicap ?? "unknown"}`,
+    `miss: ${miss ?? "unknown"}`,
+    `wind: ${wind ?? "calm/unknown"}`,
+    `wind_strength: ${wind_strength ?? "—"}`,
+    `green_speed: ${effGreen}`,
+    (captain_mode && (pin_lr || effPinFB)) ? `pin_position: side=${pin_lr||"?"}, depth=${effPinFB||"?"} (flag=${effFlagTxt})` : null
+  ].filter(Boolean).join("\n- ");
+
+  const prompt = `
 You are a cautious golf caddie. Use ONLY the provided notes for Shawneeki hole ${haveHole ? hole : "?"} (par ${par ?? "?"}).
+
 Personalize a plan for:
-- handicap: ${handicap ?? "unknown"}
-- typical miss: ${miss ?? "unknown"}
-- wind: ${wind ?? "calm/unknown"}
+- ${condLines}
 
 SAFE:
 - ${safeArr.join("\n- ")}
 AVOID:
 - ${avoidArr.join("\n- ")}
 
-Rules:
-- Do not invent hazards or yardages beyond the notes.
-- Be concise. If info is thin, say so and default conservative.
+Course info to respect:
+- Greens are running about 10 on the Stimpmeter (on the quicker side).
+- Flag color indicates pin depth at this course: Red=Front, White=Middle, Blue=Back. If a color is provided, use that depth.
+
+Guidance rules:
+- Wind strength: Light = small yardage/aim tweaks; Moderate = club/aim adjustments; Strong = prioritize fairway/center green.
+- Green speed: Fast (~10) = play below the hole and avoid short-siding; Slow = be more assertive with landing spots.
+- Pin position: Favor the safe miss away from edges; reference L/C/R and F/M/B explicitly when helpful.
+- Do not invent hazards or yardages not implied by the notes.
+- Be concise and practical.
 
 Output contract (must follow):
 - Always return ALL keys: conservative, neutral, aggressive, club_suggestions, warnings.
@@ -55,38 +86,34 @@ Output contract (must follow):
 ${haveNotes ? "" : "\n(Notes were missing; using generic safety notes.)"}
 `.trim();
 
-
   if (!process.env.OPENAI_API_KEY) {
     return res.status(200).json({ error: "Missing OPENAI_API_KEY on server" });
   }
 
-  // Chat Completions + Structured Outputs (no Responses API here)
   const payload = {
-  model: "gpt-4o-mini", // if “model not found”, switch to "o4-mini"
-  messages: [{ role: "system", content: prompt }],
-  response_format: {
-    type: "json_schema",
-    json_schema: {
-      name: "hole_plan",
-      strict: true,
-      schema: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          conservative:     { type: "string" },
-          neutral:          { type: "string" },
-          aggressive:       { type: "string" },
-          club_suggestions: { type: "array", items: { type: "string" } },
-          warnings:         { type: "string" }
-        },
-        // ✅ REQUIRED must include EVERY key in properties:
-        required: ["conservative","neutral","aggressive","club_suggestions","warnings"]
+    model: "gpt-4o-mini", // if “model not found”, change to "o4-mini"
+    messages: [{ role: "system", content: prompt }],
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "hole_plan",
+        strict: true,
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            conservative:     { type: "string" },
+            neutral:          { type: "string" },
+            aggressive:       { type: "string" },
+            club_suggestions: { type: "array", items: { type: "string" } },
+            warnings:         { type: "string" }
+          },
+          required: ["conservative","neutral","aggressive","club_suggestions","warnings"]
+        }
       }
-    }
-  },
-  max_tokens: 400
-};
-
+    },
+    max_tokens: 400
+  };
 
   try {
     const r = await fetch("https://api.openai.com/v1/chat/completions", {

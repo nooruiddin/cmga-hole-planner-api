@@ -1,11 +1,24 @@
-// api/plan.js — bulletproof version: always returns 200 with either a plan or a clear error object
+// api/plan.js — CMGA hole planner endpoint (Vercel Serverless Function)
+// Uses OpenAI Responses API with text.format JSON schema (Aug 2025).
+
 export default async function handler(req, res) {
-  // --- CORS ---
-  res.setHeader("Access-Control-Allow-Origin", "https://www.canadamga.ca");
+  // --- CORS (allow www + bare domain) ---
+  const allowed = new Set([
+    "https://www.canadamga.ca",
+    "https://canadamga.ca"
+  ]);
+  const origin = req.headers.origin || "";
+  if (allowed.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else {
+    // default to www (keeps it tight)
+    res.setHeader("Access-Control-Allow-Origin", "https://www.canadamga.ca");
+  }
   res.setHeader("Access-Control-Allow-Headers", "content-type");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+  if (req.method !== "POST")  return res.status(405).send("Method Not Allowed");
 
   // --- Robust body parse (JSON or raw string) ---
   let body = req.body;
@@ -14,10 +27,10 @@ export default async function handler(req, res) {
   }
 
   const { hole, par, notes, miss, handicap, wind } = body || {};
-  const haveHole  = typeof hole !== "undefined" && hole !== null && hole !== "";
+  const haveHole  = !(hole === undefined || hole === null || hole === "");
   const haveNotes = notes && Array.isArray(notes.safe) && Array.isArray(notes.avoid);
 
-  // --- MOCK switch: set MOCK=1 in Vercel env to bypass OpenAI while testing ---
+  // Optional “mock mode” for quick sanity (set MOCK=1 in Vercel env)
   if (process.env.MOCK === "1") {
     return res.status(200).json({
       conservative: "Fairway finder to your number, center-green.",
@@ -28,7 +41,7 @@ export default async function handler(req, res) {
     });
   }
 
-  // If client didn’t send hole/notes, don’t 400. We’ll still return a plan using generic notes.
+  // Fallback to generic notes if the client didn’t send any
   const safeArr  = haveNotes ? notes.safe  : ["Favor center line; play to the fat side."];
   const avoidArr = haveNotes ? notes.avoid : ["Don’t short-side; avoid water/front penalties."];
 
@@ -50,31 +63,31 @@ Rules:
 ${haveNotes ? "" : "\n(Notes were missing from the client; these are generic safety notes.)"}
 `.trim();
 
-  // --- OpenAI call (Responses API with Structured Output) ---
   if (!process.env.OPENAI_API_KEY) {
+    // Return 200 with a clear error so the front-end can show it
     return res.status(200).json({ error: "Missing OPENAI_API_KEY on server" });
   }
 
+  // --- Responses API with text.format JSON schema (replaces old response_format) ---
   const payload = {
-    model: "gpt-4o-mini", // if you see "model not found", change to "o4-mini"
+    model: "gpt-4o-mini", // if you see “model not found”, change to "o4-mini"
     input: prompt,
-    response_format: {
-      type: "json_schema",
-      json_schema: {
-        name: "hole_plan",
+    text: {
+      format: {
+        type: "json_schema",
+        strict: true,
         schema: {
           type: "object",
           additionalProperties: false,
           properties: {
-            conservative: { type: "string" },
-            neutral: { type: "string" },
-            aggressive: { type: "string" },
+            conservative:     { type: "string" },
+            neutral:          { type: "string" },
+            aggressive:       { type: "string" },
             club_suggestions: { type: "array", items: { type: "string" } },
-            warnings: { type: "string" }
+            warnings:         { type: "string" }
           },
           required: ["conservative","neutral","aggressive"]
-        },
-        strict: true
+        }
       }
     }
   };
@@ -90,26 +103,40 @@ ${haveNotes ? "" : "\n(Notes were missing from the client; these are generic saf
     });
 
     const txt = await r.text();
+    // Don’t bubble 4xx/5xx to the browser; return a clear object
+    if (!r.ok) {
+      return res.status(200).json({
+        openai_status: r.status,
+        openai_error: txt.slice(0, 2000)
+      });
+    }
 
-    // Don’t throw 400/401/etc. at the browser; return a clear error object instead.
-    if (!r.ok) return res.status(200).json({ openai_status: r.status, openai_error: txt.slice(0, 2000) });
-
+    // Extract text from Responses API
     let data;
     try { data = JSON.parse(txt); }
     catch { return res.status(200).json({ error: "OpenAI non-JSON", raw: txt.slice(0, 2000) }); }
 
     let outText = data.output_text;
     if (!outText && Array.isArray(data.output)) {
-      outText = data.output.flatMap(o => (o.content || []).map(c => c.text || "")).join("");
+      try {
+        outText = data.output
+          .flatMap(o => Array.isArray(o.content) ? o.content : [])
+          .map(c => (typeof c.text === "string" ? c.text : ""))
+          .join("");
+      } catch (_) {}
     }
-    if (!outText) return res.status(200).json({ error: "No text output from model", raw: JSON.stringify(data).slice(0, 2000) });
+    if (!outText || !outText.trim()) {
+      return res.status(200).json({ error: "No text output from model", raw: JSON.stringify(data).slice(0, 2000) });
+    }
 
+    // The model returns JSON as text; parse to an object
     let out;
     try { out = JSON.parse(outText); }
     catch { return res.status(200).json({ error: "Model output invalid JSON", raw: outText.slice(0, 2000) }); }
 
     if (!haveNotes || !haveHole) {
-      out.warnings = (out.warnings ? out.warnings + " " : "") + "Generic guidance: request lacked full hole/notes.";
+      out.warnings = (out.warnings ? out.warnings + " " : "") +
+                     "Generic guidance: request lacked full hole/notes.";
     }
 
     return res.status(200).json(out);

@@ -38,7 +38,7 @@ ${haveNotes ? "" : "\n(Notes were missing from the client; these are generic saf
 `;
 
   const payload = {
-    model: "gpt-4o-mini", // if you see "model not found", swap to "o4-mini"
+    model: "o4-mini", // if you see "model not found", swap to "o4-mini"
     input: prompt,
     response_format: {
       type: "json_schema",

@@ -1,8 +1,7 @@
 // api/plan.js — CMGA hole planner (Chat Completions + Structured Outputs)
 
 export default async function handler(req, res) {
-  // --- CORS (www + bare domain) ---
-  const allowed = new Set(["https://www.canadamga.ca","https://canadamga.ca"]);
+  const allowed = new Set(["https://www.canadamga.ca","https://canadamga.ca","https://www.canadamga.ca/shawneeki-golf-club"]);
   const origin = req.headers.origin || "";
   res.setHeader("Access-Control-Allow-Origin", allowed.has(origin) ? origin : "https://www.canadamga.ca");
   res.setHeader("Access-Control-Allow-Headers", "content-type");
@@ -10,7 +9,6 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST")  return res.status(405).send("Method Not Allowed");
 
-  // --- Body parse (JSON or raw) ---
   let body = req.body;
   if (!body || typeof body !== "object") { try { body = JSON.parse(req.body || "{}"); } catch { body = {}; } }
 
@@ -21,7 +19,6 @@ export default async function handler(req, res) {
   const haveHole  = !(hole === undefined || hole === null || hole === "");
   const haveNotes = notes && Array.isArray(notes.safe) && Array.isArray(notes.avoid);
 
-  // Mock mode (optional): set MOCK=1 in Vercel env
   if (process.env.MOCK === "1") {
     return res.status(200).json({
       conservative: "Fairway finder to center-green.",
@@ -57,12 +54,10 @@ ${haveNotes ? "" : "\n(Notes were missing; using generic safety notes.)"}
     return res.status(200).json({ error: "Missing OPENAI_API_KEY on server" });
   }
 
-  // ✅ Chat Completions + Structured Outputs (response_format.json_schema)
+  // Chat Completions + Structured Outputs (no Responses API here)
   const payload = {
-    model: "gpt-4o-mini", // if you see "model not found", change to "o4-mini"
-    messages: [
-      { role: "system", content: prompt }
-    ],
+    model: "gpt-4o-mini", // if “model not found”, change to "o4-mini"
+    messages: [{ role: "system", content: prompt }],
     response_format: {
       type: "json_schema",
       json_schema: {
